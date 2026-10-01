@@ -1323,6 +1323,208 @@ async fn accept_artifact_handoff_rejects_wrong_principal_project_and_revoked_gra
 }
 
 #[tokio::test]
+async fn accept_artifact_handoff_definite_begin_failure_does_not_reconcile_preexisting_match() {
+    let (_temp, db, runtime) = runtime_with_handoff_db("handoff-existing");
+    register_agent(
+        &runtime,
+        "existing-source",
+        Some("alice"),
+        transfer_caps(true, false),
+    )
+    .await;
+    register_agent(
+        &runtime,
+        "existing-destination",
+        Some("bob"),
+        transfer_caps(false, true),
+    )
+    .await;
+    let alice = transfer_auth("alice");
+    let bob = transfer_auth("bob");
+    let bytes = b"already present payload".to_vec();
+    let grant = create_handoff_grant(
+        &db,
+        &alice,
+        &bob,
+        "existing-source",
+        "existing-destination",
+        "paper/existing.bin",
+        &bytes,
+        "application/octet-stream",
+        true,
+    );
+    let destination_path = "artifacts/existing.bin";
+
+    for attempt in 0..2 {
+        let task = spawn_accept(
+            &runtime,
+            &grant,
+            destination_path,
+            false,
+            "accept-existing",
+            &bob,
+        );
+        complete_source_metadata(
+            &runtime,
+            "existing-source",
+            "paper/existing.bin",
+            &bytes,
+            Some("application/octet-stream"),
+        )
+        .await;
+        let request = wait_for_patch_agent_request(&runtime, "existing-destination").await;
+        assert_eq!(
+            request.kind, "file_artifact_upload_begin",
+            "attempt {attempt} must retry overwrite=false admission instead of treating a pre-existing matching file as this handoff's committed outcome"
+        );
+        complete_patch_agent_request(
+            &runtime,
+            "existing-destination",
+            &request.request_id,
+            0,
+            r#"{"path":"artifacts/existing.bin","error":"file exists and overwrite is false","failure_kind":"policy_rejected"}"#,
+            "",
+        )
+        .await;
+        let result = task.await.unwrap();
+        assert!(!result.success, "{result:?}");
+        assert_eq!(
+            result.output["error_kind"],
+            "artifact_handoff_transfer_failed"
+        );
+        assert_eq!(result.output["outcome_unknown"], false);
+    }
+}
+
+#[tokio::test]
+async fn accept_artifact_handoff_definite_finish_failure_does_not_enable_reconciliation() {
+    let (_temp, db, runtime) = runtime_with_handoff_db("handoff-finish-failed");
+    register_agent(
+        &runtime,
+        "finish-source",
+        Some("alice"),
+        transfer_caps(true, false),
+    )
+    .await;
+    register_agent(
+        &runtime,
+        "finish-destination",
+        Some("bob"),
+        transfer_caps(false, true),
+    )
+    .await;
+    let alice = transfer_auth("alice");
+    let bob = transfer_auth("bob");
+    let bytes = b"definite finish failure payload".to_vec();
+    let grant = create_handoff_grant(
+        &db,
+        &alice,
+        &bob,
+        "finish-source",
+        "finish-destination",
+        "paper/finish.bin",
+        &bytes,
+        "application/octet-stream",
+        true,
+    );
+    let destination_path = "artifacts/finish.bin";
+    let upload_id = "wc_upload_handoff_finish_failed";
+
+    let first = spawn_accept(
+        &runtime,
+        &grant,
+        destination_path,
+        true,
+        "accept-finish-failed",
+        &bob,
+    );
+    complete_source_metadata(
+        &runtime,
+        "finish-source",
+        "paper/finish.bin",
+        &bytes,
+        Some("application/octet-stream"),
+    )
+    .await;
+    complete_destination_begin(
+        &runtime,
+        "finish-destination",
+        destination_path,
+        &bytes,
+        "application/octet-stream",
+        true,
+        upload_id,
+    )
+    .await;
+    complete_one_transfer_chunk(
+        &runtime,
+        "finish-source",
+        "finish-destination",
+        "paper/finish.bin",
+        destination_path,
+        &bytes,
+        0,
+        upload_id,
+    )
+    .await;
+    let finish = wait_for_patch_agent_request(&runtime, "finish-destination").await;
+    assert_eq!(finish.kind, "file_artifact_upload_finish");
+    complete_patch_agent_request(
+        &runtime,
+        "finish-destination",
+        &finish.request_id,
+        0,
+        &format!(
+            r#"{{"path":"{destination_path}","upload_id":"{upload_id}","committed":false,"error":"finish rejected","failure_kind":"policy_rejected"}}"#
+        ),
+        "",
+    )
+    .await;
+    complete_destination_abort(&runtime, "finish-destination", destination_path, upload_id).await;
+    let failed = first.await.unwrap();
+    assert!(!failed.success, "{failed:?}");
+    assert_eq!(
+        failed.output["error_kind"],
+        "artifact_handoff_transfer_failed"
+    );
+    assert_eq!(failed.output["outcome_unknown"], false);
+
+    let retry = spawn_accept(
+        &runtime,
+        &grant,
+        destination_path,
+        true,
+        "accept-finish-failed",
+        &bob,
+    );
+    complete_source_metadata(
+        &runtime,
+        "finish-source",
+        "paper/finish.bin",
+        &bytes,
+        Some("application/octet-stream"),
+    )
+    .await;
+    let next = wait_for_patch_agent_request(&runtime, "finish-destination").await;
+    assert_eq!(
+        next.kind, "file_artifact_upload_begin",
+        "definite finish failure must retry transfer rather than reconcile arbitrary destination bytes"
+    );
+    complete_patch_agent_request(
+        &runtime,
+        "finish-destination",
+        &next.request_id,
+        0,
+        r#"{"path":"artifacts/finish.bin","error":"retry stopped","failure_kind":"policy_rejected"}"#,
+        "",
+    )
+    .await;
+    let retry_result = retry.await.unwrap();
+    assert!(!retry_result.success, "{retry_result:?}");
+    assert_eq!(retry_result.output["outcome_unknown"], false);
+}
+
+#[tokio::test]
 async fn accept_artifact_handoff_reconciles_unknown_finish_without_second_import() {
     let (_temp, db, runtime) = runtime_with_handoff_db("handoff-unknown");
     register_agent(
@@ -1496,6 +1698,14 @@ async fn accept_artifact_handoff_replays_completed_result_after_restart() {
             chrono::Utc::now().timestamp_millis(),
         )
         .unwrap();
+    db.mark_artifact_handoff_acceptance_destination_reconcile_allowed(
+        &handoff_principal(&bob),
+        &grant.destination_project,
+        &grant.grant_id,
+        &claim.acceptance.acceptance_id,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .unwrap();
     db.complete_artifact_handoff_acceptance(
         &handoff_principal(&bob),
         &grant.destination_project,

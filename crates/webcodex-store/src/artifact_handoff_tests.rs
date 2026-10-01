@@ -368,6 +368,29 @@ fn acceptance_replay_reconciles_and_conflicting_replay_fails_closed() {
         ArtifactHandoffGrantState::Active
     );
 
+    let premature_completion = db
+        .complete_artifact_handoff_acceptance(
+            &destination,
+            "agent:destination-runner:destination-project",
+            &grant.grant_id,
+            &started.acceptance.acceptance_id,
+            outcome(),
+            now + 4,
+        )
+        .unwrap_err();
+    assert_unavailable(&premature_completion);
+
+    let reconcile_allowed = db
+        .mark_artifact_handoff_acceptance_destination_reconcile_allowed(
+            &destination,
+            "agent:destination-runner:destination-project",
+            &grant.grant_id,
+            &started.acceptance.acceptance_id,
+            now + 4,
+        )
+        .unwrap();
+    assert!(reconcile_allowed.acceptance.destination_reconcile_allowed);
+
     let completed = db
         .complete_artifact_handoff_acceptance(
             &destination,
@@ -459,6 +482,17 @@ fn acceptance_identity_and_completion_recover_after_restart() {
     assert!(replay.replayed);
     assert_eq!(replay.acceptance.acceptance_id, acceptance_id);
 
+    let reconcile_allowed = db
+        .mark_artifact_handoff_acceptance_destination_reconcile_allowed(
+            &destination,
+            "agent:destination-runner:destination-project",
+            &grant_id,
+            &acceptance_id,
+            20_003,
+        )
+        .unwrap();
+    assert!(reconcile_allowed.acceptance.destination_reconcile_allowed);
+
     let completed = db
         .complete_artifact_handoff_acceptance(
             &destination,
@@ -485,6 +519,33 @@ fn acceptance_identity_and_completion_recover_after_restart() {
         .unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.acceptance, completed);
+    assert!(replay.acceptance.destination_reconcile_allowed);
+}
+
+#[test]
+fn artifact_handoff_schema_migrates_destination_reconcile_allowed_fence() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("artifact-handoff-migration.db");
+    let db = Database::open(&path).unwrap();
+    db.conn_for_tests()
+        .execute(
+            "ALTER TABLE wc_artifact_handoff_acceptances DROP COLUMN destination_reconcile_allowed",
+            [],
+        )
+        .unwrap();
+    drop(db);
+
+    let reopened = Database::open(&path).unwrap();
+    let count: i64 = reopened
+        .conn_for_tests()
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('wc_artifact_handoff_acceptances')
+             WHERE name = 'destination_reconcile_allowed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
 }
 
 #[test]
@@ -529,6 +590,7 @@ fn import_request_hash_binds_every_semantic_field_and_prepared_claim_revalidates
         claim.acceptance.state,
         ArtifactHandoffAcceptanceState::Prepared
     );
+    assert!(!claim.acceptance.destination_reconcile_allowed);
 
     let revalidated = db
         .revalidate_artifact_handoff_acceptance(
@@ -541,6 +603,17 @@ fn import_request_hash_binds_every_semantic_field_and_prepared_claim_revalidates
         .unwrap();
     assert_eq!(revalidated.grant, grant);
     assert_eq!(revalidated.acceptance, claim.acceptance);
+
+    let reconcile_allowed = db
+        .mark_artifact_handoff_acceptance_destination_reconcile_allowed(
+            &destination,
+            &grant.destination_project,
+            &grant.grant_id,
+            &claim.acceptance.acceptance_id,
+            30_002,
+        )
+        .unwrap();
+    assert!(reconcile_allowed.acceptance.destination_reconcile_allowed);
 
     db.revoke_artifact_handoff_grant(&source, &grant.source_project, &grant.grant_id, 30_003)
         .unwrap();

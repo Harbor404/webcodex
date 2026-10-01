@@ -336,6 +336,10 @@ pub struct ArtifactHandoffAcceptance {
     pub destination_project: String,
     pub request_hash: String,
     pub state: ArtifactHandoffAcceptanceState,
+    /// Durable evidence that the final destination commit returned success or an
+    /// outcome-unknown result. Only such Prepared acceptances may reconcile an
+    /// existing destination file on replay; earlier transfer failures must retry.
+    pub destination_reconcile_allowed: bool,
     pub outcome: Option<ArtifactHandoffAcceptanceOutcome>,
     pub created_at_unix_ms: i64,
     pub completed_at_unix_ms: Option<i64>,
@@ -380,6 +384,7 @@ struct PersistedAcceptance {
     idempotency_key_hash: String,
     request_hash: String,
     state: String,
+    destination_reconcile_allowed: i64,
     destination_path: Option<String>,
     destination_bytes: Option<i64>,
     destination_sha256: Option<String>,
@@ -439,6 +444,8 @@ impl Database {
                 idempotency_key_hash TEXT NOT NULL,
                 request_hash TEXT NOT NULL CHECK(length(request_hash) = 64),
                 state TEXT NOT NULL CHECK(state IN ('prepared', 'completed')),
+                destination_reconcile_allowed INTEGER NOT NULL DEFAULT 0
+                    CHECK(destination_reconcile_allowed IN (0, 1)),
                 destination_path TEXT,
                 destination_bytes INTEGER CHECK(destination_bytes IS NULL OR destination_bytes >= 0),
                 destination_sha256 TEXT,
@@ -464,6 +471,22 @@ impl Database {
                 ON wc_artifact_handoff_acceptances(grant_id, created_at_unix_ms, acceptance_id);
             ",
         )?;
+        let has_destination_reconcile_allowed: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('wc_artifact_handoff_acceptances')
+                WHERE name = 'destination_reconcile_allowed'
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_destination_reconcile_allowed {
+            conn.execute(
+                "ALTER TABLE wc_artifact_handoff_acceptances
+                 ADD COLUMN destination_reconcile_allowed INTEGER NOT NULL DEFAULT 0
+                 CHECK(destination_reconcile_allowed IN (0, 1))",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -662,6 +685,7 @@ impl Database {
             destination_project: grant.destination_project.clone(),
             request_hash: request_hash.to_string(),
             state: ArtifactHandoffAcceptanceState::Prepared,
+            destination_reconcile_allowed: false,
             outcome: None,
             created_at_unix_ms: now_unix_ms,
             completed_at_unix_ms: None,
@@ -671,9 +695,10 @@ impl Database {
                 "INSERT INTO wc_artifact_handoff_acceptances (
                     acceptance_id, grant_id, destination_principal_kind,
                     destination_principal_digest, destination_project, idempotency_key_hash,
-                    request_hash, state, destination_path, destination_bytes,
-                    destination_sha256, created_at_unix_ms, completed_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'prepared', NULL, NULL, NULL, ?8, NULL)",
+                    request_hash, state, destination_reconcile_allowed,
+                    destination_path, destination_bytes, destination_sha256,
+                    created_at_unix_ms, completed_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'prepared', 0, NULL, NULL, NULL, ?8, NULL)",
                 params![
                     acceptance.acceptance_id,
                     acceptance.grant_id,
@@ -771,6 +796,74 @@ impl Database {
         })
     }
 
+    /// Recheck grant/acceptance authority after the final destination commit
+    /// returned success or outcome-unknown and durably enable replay-time
+    /// destination reconciliation. Earlier transfer phases keep this bit false.
+    pub fn mark_artifact_handoff_acceptance_destination_reconcile_allowed(
+        &self,
+        destination_principal: &ArtifactHandoffPrincipal,
+        destination_project: &str,
+        grant_id: &str,
+        acceptance_id: &str,
+        now_unix_ms: i64,
+    ) -> Result<ArtifactHandoffAcceptanceClaim, ArtifactHandoffStoreError> {
+        validate_principal(destination_principal).map_err(|_| unavailable())?;
+        let destination_project =
+            validate_project(destination_project).map_err(|_| unavailable())?;
+        if !valid_artifact_handoff_id(grant_id, ARTIFACT_HANDOFF_GRANT_ID_PREFIX)
+            || !valid_artifact_handoff_id(acceptance_id, ARTIFACT_HANDOFF_ACCEPTANCE_ID_PREFIX)
+            || now_unix_ms <= 0
+        {
+            return Err(unavailable());
+        }
+        let mut conn = self.lock_connection(crate::StoreDomain::ArtifactHandoff);
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_error)?;
+        let grant = load_grant(&transaction, grant_id)?.ok_or_else(unavailable)?;
+        if &grant.destination_principal != destination_principal
+            || grant.destination_project != destination_project
+        {
+            return Err(unavailable());
+        }
+        let mut acceptance =
+            load_acceptance(&transaction, acceptance_id)?.ok_or_else(unavailable)?;
+        if acceptance.grant_id != grant_id
+            || &acceptance.destination_principal != destination_principal
+            || acceptance.destination_project != destination_project
+        {
+            return Err(unavailable());
+        }
+        if acceptance.state == ArtifactHandoffAcceptanceState::Completed {
+            transaction.commit().map_err(store_error)?;
+            return Ok(ArtifactHandoffAcceptanceClaim {
+                grant,
+                acceptance,
+                replayed: true,
+            });
+        }
+        if !grant.active_at(now_unix_ms) {
+            return Err(unavailable());
+        }
+        if !acceptance.destination_reconcile_allowed {
+            transaction
+                .execute(
+                    "UPDATE wc_artifact_handoff_acceptances
+                        SET destination_reconcile_allowed = 1
+                      WHERE acceptance_id = ?1 AND state = 'prepared'",
+                    params![acceptance_id],
+                )
+                .map_err(store_error)?;
+            acceptance.destination_reconcile_allowed = true;
+        }
+        transaction.commit().map_err(store_error)?;
+        Ok(ArtifactHandoffAcceptanceClaim {
+            grant,
+            acceptance,
+            replayed: false,
+        })
+    }
+
     /// Record the exact destination result after the existing transfer path
     /// completes. This store method never moves artifact bytes itself.
     pub fn complete_artifact_handoff_acceptance(
@@ -818,6 +911,9 @@ impl Database {
                 return Ok(acceptance);
             }
             return Err(completion_conflict());
+        }
+        if !acceptance.destination_reconcile_allowed {
+            return Err(unavailable());
         }
         let completed_at = now_unix_ms.max(acceptance.created_at_unix_ms);
         transaction
@@ -1122,8 +1218,8 @@ fn load_acceptance(
         .query_row(
             "SELECT acceptance_id, grant_id, destination_principal_kind,
                     destination_principal_digest, destination_project, idempotency_key_hash,
-                    request_hash, state, destination_path, destination_bytes,
-                    destination_sha256, created_at_unix_ms, completed_at_unix_ms
+                    request_hash, state, destination_reconcile_allowed, destination_path,
+                    destination_bytes, destination_sha256, created_at_unix_ms, completed_at_unix_ms
                FROM wc_artifact_handoff_acceptances
               WHERE acceptance_id = ?1",
             params![acceptance_id],
@@ -1144,8 +1240,8 @@ fn load_acceptance_by_key(
         .query_row(
             "SELECT acceptance_id, grant_id, destination_principal_kind,
                     destination_principal_digest, destination_project, idempotency_key_hash,
-                    request_hash, state, destination_path, destination_bytes,
-                    destination_sha256, created_at_unix_ms, completed_at_unix_ms
+                    request_hash, state, destination_reconcile_allowed, destination_path,
+                    destination_bytes, destination_sha256, created_at_unix_ms, completed_at_unix_ms
                FROM wc_artifact_handoff_acceptances
               WHERE destination_principal_kind = ?1
                 AND destination_principal_digest = ?2
@@ -1174,11 +1270,12 @@ fn persisted_acceptance_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Persist
         idempotency_key_hash: row.get(5)?,
         request_hash: row.get(6)?,
         state: row.get(7)?,
-        destination_path: row.get(8)?,
-        destination_bytes: row.get(9)?,
-        destination_sha256: row.get(10)?,
-        created_at_unix_ms: row.get(11)?,
-        completed_at_unix_ms: row.get(12)?,
+        destination_reconcile_allowed: row.get(8)?,
+        destination_path: row.get(9)?,
+        destination_bytes: row.get(10)?,
+        destination_sha256: row.get(11)?,
+        created_at_unix_ms: row.get(12)?,
+        completed_at_unix_ms: row.get(13)?,
     })
 }
 
@@ -1192,6 +1289,7 @@ fn persisted_acceptance(
         || !is_lower_hex_sha256(&persisted.idempotency_key_hash)
         || !is_lower_hex_sha256(&persisted.request_hash)
         || persisted.created_at_unix_ms <= 0
+        || !matches!(persisted.destination_reconcile_allowed, 0 | 1)
     {
         return Err(persisted_state_error());
     }
@@ -1246,6 +1344,7 @@ fn persisted_acceptance(
             .map_err(|_| persisted_state_error())?,
         request_hash: persisted.request_hash,
         state,
+        destination_reconcile_allowed: persisted.destination_reconcile_allowed == 1,
         outcome,
         created_at_unix_ms: persisted.created_at_unix_ms,
         completed_at_unix_ms: persisted.completed_at_unix_ms,

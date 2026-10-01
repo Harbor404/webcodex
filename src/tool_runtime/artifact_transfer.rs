@@ -81,6 +81,7 @@ fn artifact_handoff_source_auth() -> AuthContext {
     auth
 }
 
+#[derive(Clone, Copy)]
 struct ArtifactHandoffTransferFence<'a> {
     principal: &'a ArtifactHandoffPrincipal,
     claim: &'a ArtifactHandoffAcceptanceClaim,
@@ -326,7 +327,7 @@ impl ToolRuntime {
             Err(_) => return artifact_handoff_unavailable(),
         };
 
-        if replayed {
+        if replayed && claim.acceptance.destination_reconcile_allowed {
             if let Err(error) = self
                 .revalidate_handoff_source_snapshot(&source, &claim.grant, Some(&source_auth))
                 .await
@@ -647,7 +648,6 @@ impl ToolRuntime {
                 }),
             );
         };
-
         let mut offset = 0usize;
         while offset < snapshot.bytes {
             let length = (snapshot.bytes - offset).min(INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES);
@@ -900,6 +900,53 @@ impl ToolRuntime {
                 transport,
             )
             .await;
+        if let Some(fence) = handoff_fence {
+            let should_enable_reconciliation =
+                finish.success || !artifact_upload_failure_is_definite(&finish, &upload_id);
+            if should_enable_reconciliation {
+                let Some(db) = self.communication_db.as_ref() else {
+                    return ToolResult::err_with_output(
+                        "Artifact handoff destination commit outcome is unknown",
+                        json!({
+                            "error_kind": "destination_finish_outcome_unknown",
+                            "source_project": source_project,
+                            "source_path": source_path,
+                            "destination_project": destination_project,
+                            "destination_path": destination_path,
+                            "outcome_unknown": true,
+                        }),
+                    );
+                };
+                match db.mark_artifact_handoff_acceptance_destination_reconcile_allowed(
+                    fence.principal,
+                    &destination_project,
+                    &fence.claim.grant.grant_id,
+                    &fence.claim.acceptance.acceptance_id,
+                    Utc::now().timestamp_millis(),
+                ) {
+                    Ok(claim)
+                        if claim.acceptance.state
+                            == crate::db::ArtifactHandoffAcceptanceState::Completed =>
+                    {
+                        return self.artifact_handoff_success(claim, true);
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        return ToolResult::err_with_output(
+                            "Artifact handoff destination commit outcome is unknown",
+                            json!({
+                                "error_kind": "destination_finish_outcome_unknown",
+                                "source_project": source_project,
+                                "source_path": source_path,
+                                "destination_project": destination_project,
+                                "destination_path": destination_path,
+                                "outcome_unknown": true,
+                            }),
+                        );
+                    }
+                }
+            }
+        }
         if !finish.success {
             let definite = artifact_upload_failure_is_definite(&finish, &upload_id);
             let cleaned = if definite {
