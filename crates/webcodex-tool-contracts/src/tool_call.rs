@@ -1568,6 +1568,14 @@ pub enum ToolCall {
         /// Required explicit wc_sess_* business Session id for the current coding task, obtained from its
         /// compatible Session bootstrap.
         session_id: String,
+        /// Optional 1..16 regular output files (up to 256 MiB each) to observe independently through the Runner.
+        /// Paths are project-relative, unique, at most 512 UTF-8 bytes, and must not be sensitive.
+        /// Observations retain size/SHA/MIME, not content. Missing/unavailable outputs block closeout;
+        /// existing files do not prove task-specific counts, content or format correctness.
+        #[schemars(length(max = 16))]
+        #[schemars(inner(length(min = 1, max = 512)))]
+        #[serde(default)]
+        outputs: Vec<String>,
         /// When true, return the minimal decision-complete closeout only: workspace cleanliness/conflicts,
         /// hygiene state, bounded Job counts, final validation state/counts, tool-failure actionability
         /// counts, canonical task_outcome, evidence_integrity, warnings, and suggested_next_actions. Omits
@@ -4805,8 +4813,8 @@ pub enum ToolCall {
         expected_sha256: Option<String>,
     },
 
-    /// Read bounded metadata for a binary project artifact. Zip files are
-    /// counted but never extracted.
+    /// Read metadata for a project artifact up to 256 MiB using bounded streaming hashing.
+    /// Zip files are counted but never extracted.
     ReadProjectArtifactMetadata {
         /// Runner-registered project id.
         project: String,
@@ -6115,7 +6123,8 @@ impl ToolCall {
             | Self::WorkspaceCheckpointShow { session_id, .. }
             | Self::WorkspaceCheckpointRestore { session_id, .. }
             | Self::WorkspaceCheckpointDelete { session_id, .. } => session_id.as_deref(),
-            Self::SessionHandoffSummary { session_id, .. } => Some(session_id.as_str()),
+            Self::SessionHandoffSummary { session_id, .. }
+            | Self::FinishCodingTask { session_id, .. } => Some(session_id.as_str()),
             // Window-card presentation/refresh never becomes generic Session recorder
             // evidence. An optional Session selector is association evidence only.
             Self::PresentWorkResult { .. }

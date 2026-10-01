@@ -2103,6 +2103,7 @@ impl ToolCallAuditProjection for ToolCall {
             Self::FinishCodingTask {
                 project,
                 session_id,
+                outputs,
                 summary_only,
                 include_diff,
                 include_workspace,
@@ -2112,6 +2113,7 @@ impl ToolCallAuditProjection for ToolCall {
             } => serde_json::json!({
                 "project": project,
                 "session_id": session_id,
+                "outputs": outputs,
                 "summary_only": summary_only,
                 "include_diff": include_diff,
                 "include_workspace": include_workspace,

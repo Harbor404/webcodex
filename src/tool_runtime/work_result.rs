@@ -333,6 +333,9 @@ impl ToolRuntime {
             );
             projection["session"] = work_result_session(summary);
             projection["session_id"] = json!(summary.session_id);
+            if let Some(outputs) = super::task_outputs::retained_task_outputs(summary) {
+                projection["task_outputs"] = outputs;
+            }
             if let Some(detail) = self.workflow_session_console_detail(
                 &resolved_project,
                 &summary.session_id,
@@ -342,10 +345,10 @@ impl ToolRuntime {
                     "activity": detail.activity.iter().map(|item| {
                         json!({
                             "label": match item.kind.as_str() {
-                                "Read" => "Read project files",
+                                "Read" => "Read files",
                                 "Searched" => "Searched the project",
                                 "Navigated" | "Explored" => "Explored the project",
-                                "Edited" => "Edited code",
+                                "Edited" => "Edited files",
                                 "Tested" => "Ran checks",
                                 "Reviewed" => "Reviewed changes",
                                 "Ran" => "Ran a command",
@@ -819,9 +822,9 @@ fn semantic_activity_label(tool: &str, current: bool) -> &'static str {
     {
         Some("read") => {
             if current {
-                "Reading project files"
+                "Reading files"
             } else {
-                "Read project files"
+                "Read files"
             }
         }
         Some("search") => {
@@ -840,9 +843,9 @@ fn semantic_activity_label(tool: &str, current: bool) -> &'static str {
         }
         Some("edit") => {
             if current {
-                "Editing code"
+                "Editing files"
             } else {
-                "Edited code"
+                "Edited files"
             }
         }
         Some("run") => {
