@@ -48,6 +48,15 @@ fn outcome() -> ArtifactHandoffAcceptanceOutcome {
     }
 }
 
+fn import_request(grant_id: &str) -> ArtifactHandoffImportRequest {
+    ArtifactHandoffImportRequest {
+        grant_id: grant_id.to_string(),
+        destination_project: "agent:destination-runner:destination-project".to_string(),
+        destination_path: "imports/handed-off-report.txt".to_string(),
+        overwrite: false,
+    }
+}
+
 fn assert_unavailable(error: &ArtifactHandoffStoreError) {
     assert_eq!(error.code(), "artifact_handoff_grant_unavailable");
 }
@@ -246,7 +255,7 @@ fn expiry_defaults_and_server_cap_are_durable_and_fail_closed() {
     );
 
     let already_expired = db
-        .create_artifact_handoff_grant(&source, new_grant(destination, Some(0)), now)
+        .create_artifact_handoff_grant(&source, new_grant(destination.clone(), Some(0)), now)
         .unwrap_err();
     assert_eq!(already_expired.code(), "invalid_artifact_handoff_ttl");
 
@@ -259,6 +268,15 @@ fn expiry_defaults_and_server_cap_are_durable_and_fail_closed() {
         )
         .unwrap_err();
     assert_unavailable(&expired);
+    assert_unavailable(
+        &db.begin_artifact_handoff_import(
+            &destination,
+            &import_request(&default_grant.grant_id),
+            "expired-import",
+            default_grant.expires_at_unix_ms,
+        )
+        .unwrap_err(),
+    );
 }
 
 #[test]
@@ -467,4 +485,73 @@ fn acceptance_identity_and_completion_recover_after_restart() {
         .unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.acceptance, completed);
+}
+
+#[test]
+fn import_request_hash_binds_every_semantic_field_and_prepared_claim_revalidates_live_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("artifact-handoff-import.db")).unwrap();
+    let source = communication_principal("oauth2", 'a');
+    let destination = communication_principal("oauth2", 'b');
+    let grant = db
+        .create_artifact_handoff_grant(
+            &source,
+            new_grant(destination.clone(), Some(60_000)),
+            30_000,
+        )
+        .unwrap();
+    let request = import_request(&grant.grant_id);
+    let request_hash = request.request_hash().unwrap();
+    assert_eq!(request.request_hash().unwrap(), request_hash);
+
+    let mut changed_path = request.clone();
+    changed_path.destination_path = "imports/other.txt".to_string();
+    assert_ne!(changed_path.request_hash().unwrap(), request_hash);
+
+    let mut changed_overwrite = request.clone();
+    changed_overwrite.overwrite = true;
+    assert_ne!(changed_overwrite.request_hash().unwrap(), request_hash);
+
+    let mut changed_grant = request.clone();
+    changed_grant.grant_id = "wc_handoff_mZmZmZmZmZmZmZmZ".to_string();
+    assert_ne!(changed_grant.request_hash().unwrap(), request_hash);
+
+    let mut changed_project = request.clone();
+    changed_project.destination_project = "agent:other:destination-project".to_string();
+    assert_ne!(changed_project.request_hash().unwrap(), request_hash);
+
+    let claim = db
+        .begin_artifact_handoff_import(&destination, &request, "accept-import", 30_001)
+        .unwrap();
+    assert!(!claim.replayed);
+    assert_eq!(claim.grant, grant);
+    assert_eq!(
+        claim.acceptance.state,
+        ArtifactHandoffAcceptanceState::Prepared
+    );
+
+    let revalidated = db
+        .revalidate_artifact_handoff_acceptance(
+            &destination,
+            &grant.destination_project,
+            &grant.grant_id,
+            &claim.acceptance.acceptance_id,
+            30_002,
+        )
+        .unwrap();
+    assert_eq!(revalidated.grant, grant);
+    assert_eq!(revalidated.acceptance, claim.acceptance);
+
+    db.revoke_artifact_handoff_grant(&source, &grant.source_project, &grant.grant_id, 30_003)
+        .unwrap();
+    assert_unavailable(
+        &db.revalidate_artifact_handoff_acceptance(
+            &destination,
+            &grant.destination_project,
+            &grant.grant_id,
+            &claim.acceptance.acceptance_id,
+            30_004,
+        )
+        .unwrap_err(),
+    );
 }

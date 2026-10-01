@@ -5,7 +5,9 @@
 //! destination authority, mandatory expiry, and idempotency identity that the
 //! existing snapshot-fenced transfer path can consume later.
 
-use super::communication::{digest_text, validate_communication_principal, CommunicationPrincipal};
+use super::communication::{
+    digest_json, digest_text, validate_communication_principal, CommunicationPrincipal,
+};
 use super::Database;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
@@ -24,6 +26,7 @@ pub const MAX_ARTIFACT_HANDOFF_NAME_BYTES: usize = 255;
 
 const ARTIFACT_HANDOFF_KEY_DIGEST_DOMAIN: &str =
     "webcodex.artifact-handoff.acceptance-idempotency-key.v1";
+const ARTIFACT_HANDOFF_IMPORT_REQUEST_DOMAIN: &str = "webcodex.artifact-handoff.import-request.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactHandoffStoreError {
@@ -234,6 +237,35 @@ pub struct NewArtifactHandoffGrant {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ArtifactHandoffImportRequest {
+    pub grant_id: String,
+    pub destination_project: String,
+    pub destination_path: String,
+    pub overwrite: bool,
+}
+
+impl ArtifactHandoffImportRequest {
+    /// Hash every caller-controlled semantic field before using an idempotency
+    /// key. Transport/session metadata is intentionally excluded; rerunning the
+    /// same logical import with a different key remains a distinct operation.
+    pub fn request_hash(&self) -> Result<String, ArtifactHandoffStoreError> {
+        self.validate()?;
+        digest_json(ARTIFACT_HANDOFF_IMPORT_REQUEST_DOMAIN, self).map_err(|error| {
+            tracing::warn!(error = %error, "artifact handoff import request serialization failed");
+            invalid_request_hash()
+        })
+    }
+
+    fn validate(&self) -> Result<(), ArtifactHandoffStoreError> {
+        if !valid_artifact_handoff_id(&self.grant_id, ARTIFACT_HANDOFF_GRANT_ID_PREFIX) {
+            return Err(unavailable());
+        }
+        validate_project(&self.destination_project)?;
+        validate_import_path(&self.destination_path)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ArtifactHandoffGrant {
     pub grant_id: String,
     pub source_principal: ArtifactHandoffPrincipal,
@@ -311,6 +343,7 @@ pub struct ArtifactHandoffAcceptance {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactHandoffAcceptanceClaim {
+    pub grant: ArtifactHandoffGrant,
     pub acceptance: ArtifactHandoffAcceptance,
     pub replayed: bool,
 }
@@ -607,6 +640,7 @@ impl Database {
                 return Err(idempotency_conflict());
             }
             return Ok(ArtifactHandoffAcceptanceClaim {
+                grant,
                 acceptance: existing,
                 replayed: true,
             });
@@ -623,9 +657,9 @@ impl Database {
                 ARTIFACT_HANDOFF_ACCEPTANCE_ID_PREFIX,
                 "SELECT 1 FROM wc_artifact_handoff_acceptances WHERE acceptance_id = ?1",
             )?,
-            grant_id: grant.grant_id,
+            grant_id: grant.grant_id.clone(),
             destination_principal: destination_principal.clone(),
-            destination_project: grant.destination_project,
+            destination_project: grant.destination_project.clone(),
             request_hash: request_hash.to_string(),
             state: ArtifactHandoffAcceptanceState::Prepared,
             outcome: None,
@@ -654,8 +688,86 @@ impl Database {
             .map_err(store_error)?;
         transaction.commit().map_err(store_error)?;
         Ok(ArtifactHandoffAcceptanceClaim {
+            grant,
             acceptance,
             replayed: false,
+        })
+    }
+
+    /// Compute the full semantic request hash and begin one import acceptance.
+    /// This is the data-plane entry point; callers must not precompute a hash
+    /// from only the grant id or destination project.
+    pub fn begin_artifact_handoff_import(
+        &self,
+        destination_principal: &ArtifactHandoffPrincipal,
+        request: &ArtifactHandoffImportRequest,
+        idempotency_key: &str,
+        now_unix_ms: i64,
+    ) -> Result<ArtifactHandoffAcceptanceClaim, ArtifactHandoffStoreError> {
+        let request_hash = request.request_hash()?;
+        self.begin_artifact_handoff_acceptance(
+            destination_principal,
+            &request.destination_project,
+            &request.grant_id,
+            idempotency_key,
+            &request_hash,
+            now_unix_ms,
+        )
+    }
+
+    /// Recheck durable grant/acceptance authority immediately before a
+    /// prepared claim starts or resumes a transfer. A replay of the same key
+    /// cannot bypass revocation, expiry, or consumption by another acceptance.
+    pub fn revalidate_artifact_handoff_acceptance(
+        &self,
+        destination_principal: &ArtifactHandoffPrincipal,
+        destination_project: &str,
+        grant_id: &str,
+        acceptance_id: &str,
+        now_unix_ms: i64,
+    ) -> Result<ArtifactHandoffAcceptanceClaim, ArtifactHandoffStoreError> {
+        validate_principal(destination_principal).map_err(|_| unavailable())?;
+        let destination_project =
+            validate_project(destination_project).map_err(|_| unavailable())?;
+        if !valid_artifact_handoff_id(grant_id, ARTIFACT_HANDOFF_GRANT_ID_PREFIX)
+            || !valid_artifact_handoff_id(acceptance_id, ARTIFACT_HANDOFF_ACCEPTANCE_ID_PREFIX)
+            || now_unix_ms <= 0
+        {
+            return Err(unavailable());
+        }
+        let mut conn = self.lock_connection(crate::StoreDomain::ArtifactHandoff);
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_error)?;
+        let grant = load_grant(&transaction, grant_id)?.ok_or_else(unavailable)?;
+        if &grant.destination_principal != destination_principal
+            || grant.destination_project != destination_project
+        {
+            return Err(unavailable());
+        }
+        let acceptance = load_acceptance(&transaction, acceptance_id)?.ok_or_else(unavailable)?;
+        if acceptance.grant_id != grant_id
+            || &acceptance.destination_principal != destination_principal
+            || acceptance.destination_project != destination_project
+        {
+            return Err(unavailable());
+        }
+        if acceptance.state == ArtifactHandoffAcceptanceState::Completed {
+            transaction.commit().map_err(store_error)?;
+            return Ok(ArtifactHandoffAcceptanceClaim {
+                grant,
+                acceptance,
+                replayed: true,
+            });
+        }
+        if !grant.active_at(now_unix_ms) {
+            return Err(unavailable());
+        }
+        transaction.commit().map_err(store_error)?;
+        Ok(ArtifactHandoffAcceptanceClaim {
+            grant,
+            acceptance,
+            replayed: true,
         })
     }
 
@@ -804,6 +916,23 @@ fn validate_snapshot(
         return Err(invalid_snapshot());
     }
     Ok(snapshot)
+}
+
+fn validate_import_path(path: &str) -> Result<(), ArtifactHandoffStoreError> {
+    if path.is_empty()
+        || path.len() > MAX_ARTIFACT_HANDOFF_PATH_BYTES
+        || path.contains('\0')
+        || path.contains('\\')
+        || path.starts_with('/')
+        || path.split('/').any(|component| component == "..")
+        || path.as_bytes().get(1).is_some_and(|byte| *byte == b':')
+    {
+        return Err(invalid(
+            "invalid_artifact_handoff_import_path",
+            "Artifact handoff import path is invalid",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_idempotency_key(value: &str) -> Result<String, ArtifactHandoffStoreError> {

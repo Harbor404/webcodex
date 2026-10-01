@@ -1707,6 +1707,19 @@ impl ToolCallAuditProjection for ToolCall {
                 "destination_path": destination_path,
                 "overwrite": overwrite,
             }),
+            Self::AcceptArtifactHandoff {
+                grant_id,
+                destination_project,
+                destination_path,
+                overwrite,
+                idempotency_key,
+            } => serde_json::json!({
+                "grant_id": grant_id,
+                "destination_project": destination_project,
+                "destination_path": destination_path,
+                "overwrite": overwrite,
+                "idempotency_key_present": !idempotency_key.is_empty(),
+            }),
             Self::ProjectArtifact {
                 project,
                 path,

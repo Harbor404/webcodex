@@ -83,10 +83,11 @@ pub use self::agent_wake::{
 pub use self::artifact_handoff::{
     ArtifactHandoffAcceptance, ArtifactHandoffAcceptanceClaim, ArtifactHandoffAcceptanceOutcome,
     ArtifactHandoffAcceptanceState, ArtifactHandoffGrant, ArtifactHandoffGrantState,
-    ArtifactHandoffOperation, ArtifactHandoffPrincipal, ArtifactHandoffSourceSnapshot,
-    ArtifactHandoffStoreError, NewArtifactHandoffGrant, ARTIFACT_HANDOFF_ACCEPTANCE_ID_PREFIX,
-    ARTIFACT_HANDOFF_GRANT_ID_PREFIX, DEFAULT_ARTIFACT_HANDOFF_TTL_MS,
-    MAX_ARTIFACT_HANDOFF_IDEMPOTENCY_KEY_CHARS, MAX_ARTIFACT_HANDOFF_TTL_MS,
+    ArtifactHandoffImportRequest, ArtifactHandoffOperation, ArtifactHandoffPrincipal,
+    ArtifactHandoffSourceSnapshot, ArtifactHandoffStoreError, NewArtifactHandoffGrant,
+    ARTIFACT_HANDOFF_ACCEPTANCE_ID_PREFIX, ARTIFACT_HANDOFF_GRANT_ID_PREFIX,
+    DEFAULT_ARTIFACT_HANDOFF_TTL_MS, MAX_ARTIFACT_HANDOFF_IDEMPOTENCY_KEY_CHARS,
+    MAX_ARTIFACT_HANDOFF_TTL_MS,
 };
 pub use self::communication::{
     AgentEndpointLifecycle, AgentEndpointMutation, AgentEndpointRecord, AgentIdentityMutation,

@@ -4755,6 +4755,26 @@ pub enum ToolCall {
         overwrite: Option<bool>,
     },
 
+    /// Accept one exact `ArtifactHandoffGrant` as the destination principal and
+    /// import its frozen source snapshot through the existing Control↔Runner
+    /// artifact transfer path.
+    AcceptArtifactHandoff {
+        /// Opaque durable grant id created by the source authority.
+        #[schemars(length(min = 1, max = 128))]
+        grant_id: String,
+        /// Exact or resolvable destination Runtime Project.
+        destination_project: String,
+        /// Project-relative destination artifact path.
+        #[schemars(length(min = 1, max = 4096))]
+        destination_path: String,
+        /// Allow replacing an existing destination artifact (default false).
+        #[serde(default)]
+        overwrite: Option<bool>,
+        /// Stable caller-selected key for the complete logical import request.
+        #[schemars(length(min = 1, max = 128))]
+        idempotency_key: String,
+    },
+
     /// Preferred unified read-side facade for Project artifacts. Physical
     /// dispatch remains action-specific: Runner-backed metadata/inspection and
     /// MCP presentation/authority for native images and complete export.
@@ -5980,6 +6000,7 @@ impl ToolCall {
             Self::SaveProjectArtifact { .. } => "save_project_artifact",
             Self::ImportConversationFilesToProject { .. } => "import_conversation_files_to_project",
             Self::TransferProjectArtifact { .. } => "transfer_project_artifact",
+            Self::AcceptArtifactHandoff { .. } => "accept_artifact_handoff",
             Self::ProjectArtifact { .. } => "project_artifact",
             Self::ReadProjectArtifactMetadata { .. } => "read_project_artifact_metadata",
             Self::ReadProjectArtifact { .. } => "read_project_artifact",
@@ -6175,6 +6196,10 @@ impl ToolCall {
             Self::CodeModeExec { project, .. }
             | Self::CodeModeExecEffectful { project, .. }
             | Self::CodeModeExecMutating { project, .. } => Some(project.as_str()),
+            Self::AcceptArtifactHandoff {
+                destination_project,
+                ..
+            } => Some(destination_project.as_str()),
             Self::RunProcess { project, .. }
             | Self::RunDetachedProcess { project, .. }
             | Self::CodingAgentStart { project, .. }
