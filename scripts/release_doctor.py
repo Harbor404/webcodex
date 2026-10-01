@@ -157,17 +157,12 @@ def _workflow_contract(root: Path) -> str:
             ("-Installer $env:DESKTOP_INSTALLER_PATH", build),
             ("dist/webcodex-desktop-*.dmg", build),
             ("dist/webcodex-desktop-*-${{ matrix.platform }}-setup.exe", build),
-            ("macos_ci_developer_id_setup.sh", build),
-            ("macos_sign_runner.sh", build),
+            ('bash scripts/macos_sign_runner.sh target/release/webcodex-runner "-"', build),
             ("verify_macos_desktop_identity.sh", build),
-            ("signing_mode=developer-id", build),
-            ("secrets.APPLE_CERTIFICATE", build),
-            ("secrets.APPLE_CERTIFICATE_PASSWORD", build),
-            ("secrets.APPLE_SIGNING_IDENTITY", build),
-            ("secrets.APPLE_ID", build),
-            ("secrets.APPLE_PASSWORD", build),
-            ("secrets.APPLE_TEAM_ID", build),
-        ),
+            ("signing_mode=adhoc", build),
+            ('export APPLE_SIGNING_IDENTITY="-"', build),
+            ('expected_signing = "adhoc"', build),
+            ("expected_notarized = False", build),        ),
         "release-desktop-darwin-x64.yml": (
             ("types: [published]", intel_desktop),
             ("workflow_dispatch:", intel_desktop),
@@ -177,15 +172,10 @@ def _workflow_contract(root: Path) -> str:
             ("SHA256SUMS", intel_desktop),
             ("gh release upload", intel_desktop),
             ("desktop_install_macos_smoke.sh", intel_desktop),
-            ("macos_ci_developer_id_setup.sh", intel_desktop),
-            ("macos_sign_runner.sh", intel_desktop),
-            ("developer-id", intel_desktop),
-            ("secrets.APPLE_CERTIFICATE", intel_desktop),
-            ("secrets.APPLE_ID", intel_desktop),
-            ("needs.resolve.outputs.version != '0.4.3'", intel_desktop),
-            ('if [ "$VERSION" = "0.4.3" ]', intel_desktop),
-            ("a notarized DMG cannot be reconstructed byte-for-byte", intel_desktop),
-        ),
+            ("desktop_install_macos_smoke.sh", intel_desktop),
+            ("signing_mode=adhoc", intel_desktop),
+            ('export APPLE_SIGNING_IDENTITY="-"', intel_desktop),
+            ("Treat an already-published DMG as immutable authority", intel_desktop),        ),
     }
     missing = []
     for filename, tokens in required.items():
@@ -202,13 +192,20 @@ def _workflow_contract(root: Path) -> str:
         raise DoctorError("release-readiness gained publication/upload authority")
     if "prepare_desktop_bundle.ps1" in readiness_workflow or "tauri" in readiness_workflow.lower():
         raise DoctorError("release-readiness gained Desktop candidate build responsibility")
-    if (
-        "secrets.APPLE_" in ci
-        or "secrets.APPLE_" in extended
-        or "secrets.APPLE_" in readiness_workflow
-    ):
-        raise DoctorError("ordinary/readiness CI unexpectedly depends on Apple release-signing credentials")
-    return "main/release-branch CI, extended-native readiness, Developer ID release signing, and tag-bound authoritative build contracts are consistent"
+    apple_secret_surfaces = {
+        "ci.yml": ci,
+        "extended-native.yml": extended,
+        "release-readiness.yml": readiness_workflow,
+        "release-build.yml": build,
+        "release-desktop-darwin-x64.yml": intel_desktop,
+    }
+    leaked_apple_secrets = [name for name, body in apple_secret_surfaces.items() if "secrets.APPLE_" in body]
+    if leaked_apple_secrets:
+        raise DoctorError(
+            "current ad-hoc macOS release contract unexpectedly depends on Apple release-signing credentials: "
+            + ", ".join(leaked_apple_secrets)
+        )
+    return "main/release-branch CI, extended-native readiness, ad-hoc macOS release signing, and tag-bound authoritative build contracts are consistent"
 
 
 def _compile_verifiers(root: Path) -> str:
