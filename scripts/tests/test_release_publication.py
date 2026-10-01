@@ -640,6 +640,23 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn('rustc -vV | grep -Fxq "host:', workflow)
         self.assertNotIn('file "$binary" | grep -Fq "$EXPECTED_FILE_ARCH"', workflow)
 
+    def test_current_macos_release_contract_is_adhoc_and_secret_free(self) -> None:
+        primary = Path(".github/workflows/release-build.yml").read_text(encoding="utf-8")
+        supplemental = Path(".github/workflows/release-desktop-darwin-x64.yml").read_text(encoding="utf-8")
+
+        for workflow in (primary, supplemental):
+            self.assertNotIn("secrets.APPLE_CERTIFICATE", workflow)
+            self.assertNotIn("secrets.APPLE_CERTIFICATE_PASSWORD", workflow)
+            self.assertNotIn("secrets.APPLE_ID", workflow)
+            self.assertNotIn("secrets.APPLE_PASSWORD", workflow)
+            self.assertNotIn("secrets.APPLE_TEAM_ID", workflow)
+            self.assertNotIn("signing_mode=developer-id", workflow)
+
+        self.assertIn('export APPLE_SIGNING_IDENTITY="-"', primary)
+        self.assertIn('export APPLE_SIGNING_IDENTITY="-"', supplemental)
+        self.assertIn('expected_signing = "adhoc"', primary)
+        self.assertIn("expected_notarized = False", primary)
+
     def test_release_build_stages_desktop_candidates_in_workspace_dist(self) -> None:
         workflow = Path(".github/workflows/release-build.yml").read_text(encoding="utf-8")
 

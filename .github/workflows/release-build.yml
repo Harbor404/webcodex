@@ -392,15 +392,6 @@ jobs:
             frontend/package-lock.json
             apps/desktop/package-lock.json
 
-      - name: Configure Developer ID release signing
-        if: needs.prepare.outputs.build_kind == 'release'
-        shell: bash
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-        run: bash scripts/macos_ci_developer_id_setup.sh
-
       - name: Build and verify native macOS candidate
         shell: bash
         run: |
@@ -443,11 +434,11 @@ jobs:
           done
 
           mkdir -p dist
-          runner_signing_identity="-"
-          if [ "$BUILD_KIND" = release ]; then
-            runner_signing_identity="$APPLE_SIGNING_IDENTITY"
-          fi
-          bash scripts/macos_sign_runner.sh target/release/webcodex-runner "$runner_signing_identity"
+          # Public macOS artifacts currently use the same ad-hoc signing
+          # contract as the long-running Desktop dogfood path. Developer ID /
+          # notarization is not a release prerequisite until credentials are
+          # intentionally introduced in a separately reviewed migration.
+          bash scripts/macos_sign_runner.sh target/release/webcodex-runner "-"
 
           scripts/package_release_artifact.sh dist
           canonical_archive="dist/webcodex-v$VERSION-$WEBCODEX_RELEASE_PLATFORM.tar.gz"
@@ -476,7 +467,6 @@ jobs:
           stage="$RUNNER_TEMP/webcodex-desktop-$WEBCODEX_RELEASE_PLATFORM-bundle"
           signing_mode=adhoc
           if [ "$BUILD_KIND" = release ]; then
-            signing_mode=developer-id
             desktop_name="webcodex-desktop-v$VERSION-$WEBCODEX_RELEASE_PLATFORM.dmg"
           else
             desktop_name="webcodex-desktop-$INPUT_TAG-${SOURCE_SHA:0:12}-v$VERSION-$WEBCODEX_RELEASE_PLATFORM.dmg"
@@ -496,26 +486,17 @@ jobs:
             echo "desktop_name=$desktop_name"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build signed native macOS Desktop DMG
+      - name: Build native macOS Desktop DMG
         if: matrix.platform == 'darwin-arm64' || needs.prepare.outputs.desktop_darwin_x64_supplemental != 'true'
         id: desktop_dmg
         working-directory: apps/desktop
         shell: bash
         env:
           CI: "true"
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          if [ "$BUILD_KIND" = release ]; then
-            for name in APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
-              [ -n "${!name:-}" ] || { echo "$name is required for a formal macOS release" >&2; exit 1; }
-            done
-          else
-            unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
-            export APPLE_SIGNING_IDENTITY="-"
-          fi
+          unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          export APPLE_SIGNING_IDENTITY="-"
 
           export CARGO_TARGET_DIR="$RUNNER_TEMP/webcodex-desktop-$WEBCODEX_RELEASE_PLATFORM-tauri"
           npm exec tauri -- build \
@@ -945,14 +926,6 @@ jobs:
         with:
           name: ${{ needs.prepare.outputs.archive_stem }}-${{ matrix.platform }}
           path: runtime-input
-      - name: Configure Developer ID signing for macOS unified installer
-        if: matrix.os == 'macos' && needs.prepare.outputs.build_kind == 'release'
-        shell: bash
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-        run: bash scripts/macos_ci_developer_id_setup.sh
       - name: Build and package Linux installer in Ubuntu 22.04 native container
         if: matrix.os == 'linux'
         shell: bash
@@ -1057,23 +1030,12 @@ jobs:
       - name: Collect and package macOS installer
         if: matrix.os == 'macos'
         shell: bash
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
           export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
           signing_mode=adhoc
-          if [ "$BUILD_KIND" = release ]; then
-            signing_mode=developer-id
-            for name in APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
-              [ -n "${!name:-}" ] || { echo "$name is required for a formal macOS release" >&2; exit 1; }
-            done
-          else
-            unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
-            export APPLE_SIGNING_IDENTITY="-"
-          fi
+          unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          export APPLE_SIGNING_IDENTITY="-"
           stage="$RUNNER_TEMP/unified-macos-stage"
           python3 scripts/prepare_desktop_bundle_macos.py \
             --bin-dir native-input/artifacts/bin --version "$VERSION" --source-sha "$SOURCE_SHA" \
@@ -1093,10 +1055,6 @@ jobs:
           }
           app="${apps[0]}"
           bash scripts/verify_macos_desktop_identity.sh "$app" "$signing_mode"
-          if [ "$signing_mode" = developer-id ]; then
-            spctl --assess --type execute --verbose=2 "$app"
-            xcrun stapler validate "$app"
-          fi
           rm native-input/artifacts/bin/webcodex-desktop
           cp "$app/Contents/MacOS/WebCodex" native-input/artifacts/bin/webcodex-desktop
           mkdir -p native-input/artifacts/desktop
@@ -1295,8 +1253,8 @@ jobs:
           build_kind = os.environ["BUILD_KIND"]
           if build_kind not in {"release", "verification"}:
               raise SystemExit("unknown macOS Desktop build kind")
-          expected_signing = "developer-id" if build_kind == "release" else "adhoc"
-          expected_notarized = build_kind == "release"
+          expected_signing = "adhoc"
+          expected_notarized = False
           pairs = [("darwin-arm64", os.environ["DESKTOP_DARWIN_ARM64_FILENAME"])]
           if os.environ["DESKTOP_DARWIN_X64_SUPPLEMENTAL"] != "true":
               pairs.insert(0, ("darwin-x64", os.environ["DESKTOP_DARWIN_X64_FILENAME"]))
